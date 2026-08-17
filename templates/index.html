@@ -636,6 +636,13 @@
     </div>
 
     <script>
+        // Remembered locally so the user isn't re-prompted on every visit --
+        // this is a real deployed app (not a Claude-rendered artifact), so
+        // localStorage is safe to use here. Only ever matters if the
+        // deployment owner has set ACCESS_CODE server-side; otherwise the
+        // server never asks for it.
+        let accessCode = localStorage.getItem('clearland_access_code') || '';
+
         // Set default end date to today
         const today = new Date().toISOString().split('T')[0];
         document.getElementById('end-date').value = today;
@@ -731,35 +738,60 @@
         document.getElementById('start-date').addEventListener('change', updateSourcePreview);
         document.getElementById('end-date').addEventListener('change', updateSourcePreview);
 
+        const RESOLUTION_CAPPED_TITLE =
+            "Zoomed out far enough that Sentinel-2's finer 10m resolution wouldn't " +
+            "add real detail at this scale, so Landsat is used instead -- same " +
+            "effective accuracy here, and it doesn't spend your Sentinel Hub quota.";
+
         async function updateSourcePreview() {
             const startDate = document.getElementById('start-date').value;
             const endDate = document.getElementById('end-date').value;
-            
+
             if (!startDate || !endDate) return;
-            
+
+            const mapBounds = map.getBounds();
+            const bounds = {
+                west: mapBounds.getWest(),
+                south: mapBounds.getSouth(),
+                east: mapBounds.getEast(),
+                north: mapBounds.getNorth()
+            };
+
             try {
                 const response = await fetch('/data-availability', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ start_date: startDate, end_date: endDate })
+                    body: JSON.stringify({ start_date: startDate, end_date: endDate, bounds })
                 });
-                
+
                 const data = await response.json();
-                
+
                 if (data.success) {
                     const startEl = document.getElementById('start-source');
                     const endEl = document.getElementById('end-source');
-                    
+
                     startEl.textContent = data.availability.start_date.source;
                     startEl.className = 'source-badge ' + getSourceClass(data.availability.start_date.source);
-                    
+                    startEl.title = data.availability.start_date.resolution_capped ? RESOLUTION_CAPPED_TITLE : '';
+
                     endEl.textContent = data.availability.end_date.source;
                     endEl.className = 'source-badge ' + getSourceClass(data.availability.end_date.source);
+                    endEl.title = data.availability.end_date.resolution_capped ? RESOLUTION_CAPPED_TITLE : '';
                 }
             } catch (err) {
                 console.error('Error checking data availability:', err);
             }
         }
+
+        // Keep the source preview in sync with the map, not just the dates --
+        // panning/zooming can change which source /analyze will actually use
+        // (see get_data_source_for_date in app.py). Debounced so a drag/zoom
+        // gesture doesn't fire a request per frame.
+        let sourcePreviewDebounce = null;
+        map.on('moveend', function() {
+            clearTimeout(sourcePreviewDebounce);
+            sourcePreviewDebounce = setTimeout(updateSourcePreview, 300);
+        });
 
         function getSourceClass(source) {
             if (!source) return 'unavailable';
@@ -795,6 +827,17 @@
         });
 
         // Run analysis over whatever the map is currently showing
+        function postAnalyze(body) {
+            return fetch('/analyze', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'X-Access-Code': accessCode
+                },
+                body: JSON.stringify(body)
+            });
+        }
+
         async function runAnalysis() {
             const startDate = document.getElementById('start-date').value;
             const endDate = document.getElementById('end-date').value;
@@ -836,18 +879,29 @@
             document.getElementById('results-panel').classList.remove('visible');
 
             try {
-                const response = await fetch('/analyze', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({
-                        bounds,
-                        start_date: startDate,
-                        end_date: endDate,
-                        location
-                    })
-                });
+                const analyzeBody = { bounds, start_date: startDate, end_date: endDate, location };
+                let response = await postAnalyze(analyzeBody);
+                let data = await response.json();
 
-                const data = await response.json();
+                // The server may require an access code (only if the
+                // deployment owner set ACCESS_CODE) -- prompt once, remember
+                // it locally, and retry the same request automatically.
+                if (response.status === 401 && data.error === 'access_code_required') {
+                    const entered = prompt('This ClearLand instance requires an access code to run an analysis:');
+                    if (!entered) {
+                        alert('An access code is required to run an analysis.');
+                        return;
+                    }
+                    accessCode = entered;
+                    localStorage.setItem('clearland_access_code', accessCode);
+                    response = await postAnalyze(analyzeBody);
+                    data = await response.json();
+                }
+
+                if (response.status === 429) {
+                    alert(data.error || 'Too many requests -- please wait before running another analysis.');
+                    return;
+                }
 
                 if (data.success) {
                     displayResults(data.results);

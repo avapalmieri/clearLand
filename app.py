@@ -24,12 +24,48 @@ from datetime import datetime, timedelta
 import requests
 from dotenv import load_dotenv
 from flask import Flask, jsonify, render_template, request, send_file
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
 
 load_dotenv()
 
 app = Flask(__name__)
 app.config['UPLOAD_FOLDER'] = 'uploads'
 app.config['OUTPUT_FOLDER'] = 'outputs'
+
+# --- Abuse / cost protection --------------------------------------------
+# /analyze is the expensive route: every call fetches real satellite
+# imagery (Sentinel-2 requests are metered against your Copernicus Data
+# Space processing-unit quota, and the app runs real raster processing on
+# the result). This is a public URL with no login, so without limits here,
+# anyone who finds it -- or a bot that stumbles on it -- can drive real
+# quota/compute usage for free. Two layers, both configurable via env vars
+# so they can be tuned without a code change:
+#   1. Per-IP limit (ANALYZE_LIMIT_PER_IP) -- stops one caller from
+#      hammering it.
+#   2. A global daily cap (ANALYZE_LIMIT_GLOBAL), shared across every
+#      caller regardless of IP -- bounds total worst-case usage even
+#      against many different IPs, which a per-IP limit alone can't do.
+ANALYZE_LIMIT_PER_IP = os.environ.get('ANALYZE_LIMIT_PER_IP', '15 per hour')
+ANALYZE_LIMIT_GLOBAL = os.environ.get('ANALYZE_LIMIT_GLOBAL', '200 per day')
+
+# Optional shared access code, unset by default so it adds zero friction
+# until you opt in. Set ACCESS_CODE in Render's environment variables to
+# require it -- the frontend will then prompt for it once, remember it in
+# the browser, and send it as a header on every /analyze request. This is
+# the strongest protection: rate limits slow abuse down, an access code
+# stops an anonymous caller from using /analyze at all.
+ACCESS_CODE = os.environ.get('ACCESS_CODE')
+
+limiter = Limiter(app=app, key_func=get_remote_address, storage_uri="memory://")
+
+
+@app.errorhandler(429)
+def rate_limit_exceeded(e):
+    return jsonify({
+        'success': False,
+        'error': 'Too many requests -- this endpoint is rate-limited to control satellite-API usage and cost. Please wait and try again.'
+    }), 429
 
 # Server-side mirror of the frontend's zoom-out guard: reject an analysis
 # request over an oversized area rather than silently computing NDVI at a
@@ -91,11 +127,56 @@ def compute_output_size(bounds, max_dim=MAX_OUTPUT_DIM):
     return out_w, out_h
 
 
-def get_data_source_for_date(date_str):
-    """Determine best satellite data source based on date."""
+# Landsat's native pixel size. Used to decide whether Sentinel-2's finer
+# native 10m resolution is actually usable at a given zoom level, or
+# whether the output grid is already coarser than this anyway.
+LANDSAT_NATIVE_RESOLUTION_M = 30
+
+
+def pixel_ground_resolution_m(bounds, out_width, out_height):
+    """
+    Approximate ground resolution, in meters/pixel, of the output grid
+    for a given bounds + pixel size.
+
+    This matters because `compute_output_size` always fits the analysis
+    area into a fixed-size pixel budget (max 512px on the long side): a
+    wide, zoomed-out area gets spread thin across those pixels, so each
+    one covers a lot more ground than the source imagery's native
+    resolution.
+    """
+    west, south, east, north = bounds
+    lat_center = (south + north) / 2
+    width_km = max(east - west, 1e-9) * 111.32 * math.cos(math.radians(lat_center))
+    height_km = max(north - south, 1e-9) * 111.32
+    # compute_output_size preserves aspect ratio, so these should be
+    # close to equal; average the two for robustness against edge cases.
+    res_w_m = (width_km * 1000) / max(out_width, 1)
+    res_h_m = (height_km * 1000) / max(out_height, 1)
+    return (res_w_m + res_h_m) / 2
+
+
+def get_data_source_for_date(date_str, resolution_m=None):
+    """
+    Determine the best satellite data source for a date, optionally
+    taking the requested output resolution into account.
+
+    Sentinel-2 delivers 10m native pixels; Landsat delivers 30m.
+    Ordinarily that makes Sentinel-2 the better choice whenever it's
+    available (2015-06-23 onward). But when the caller supplies
+    `resolution_m` and it's already coarser than Landsat's 30m -- i.e.
+    the output grid is being stretched over a wide, zoomed-out area --
+    resampling Sentinel-2's finer source pixels down to that grid
+    produces no more real detail than Landsat would. In that case there's
+    no detection-quality reason to spend Sentinel Hub's metered
+    processing-unit quota on it: Landsat, via Planetary Computer, is
+    free and unmetered, so this protects that quota for the close-in
+    scans where Sentinel-2's real resolution advantage actually matters.
+    """
     date = datetime.strptime(date_str, '%Y-%m-%d')
 
     if date >= datetime(2015, 6, 23):
+        if resolution_m is not None and resolution_m > LANDSAT_NATIVE_RESOLUTION_M:
+            return 'landsat-8'
         return 'sentinel-2'
     elif date >= datetime(2013, 2, 11):
         return 'landsat-8'
@@ -205,7 +286,8 @@ def fetch_ndvi_for_date(bounds, date_str, out_width=512, out_height=512):
     """
     import rasterio
 
-    source = get_data_source_for_date(date_str)
+    resolution_m = pixel_ground_resolution_m(bounds, out_width, out_height)
+    source = get_data_source_for_date(date_str, resolution_m=resolution_m)
 
     if source == 'sentinel-2':
         token = get_sentinelhub_token()
@@ -429,6 +511,8 @@ def home():
 
 
 @app.route('/analyze', methods=['POST'])
+@limiter.limit(ANALYZE_LIMIT_PER_IP)
+@limiter.limit(ANALYZE_LIMIT_GLOBAL, key_func=lambda: 'global')
 def analyze():
     """
     Run detection using real satellite data only, over either an explicit
@@ -436,6 +520,9 @@ def analyze():
     backward compatibility, a lone `lat`/`lon` point with the old fixed
     0.05-degree buffer.
     """
+    if ACCESS_CODE and request.headers.get('X-Access-Code', '') != ACCESS_CODE:
+        return jsonify({'success': False, 'error': 'access_code_required'}), 401
+
     try:
         data = request.get_json(force=True) or {}
 
@@ -511,14 +598,36 @@ def check_data_availability():
     Check which satellite data source theoretically covers a date range.
     This reflects source coverage windows, not a live scene-availability
     check -- an actual scene still has to be found by /analyze.
+
+    If the caller supplies `bounds` (the current map viewport), this also
+    reflects the zoom-dependent Sentinel-2-vs-Landsat choice described in
+    `get_data_source_for_date` -- so this preview matches what /analyze
+    will actually use instead of only ever showing the date-based answer.
+    Without `bounds` (older callers), it falls back to date-only, same as
+    before.
     """
     try:
         data = request.get_json()
         start_date = data.get('start_date')
         end_date = data.get('end_date')
 
-        start_source = get_data_source_for_date(start_date)
-        end_source = get_data_source_for_date(end_date)
+        resolution_m = None
+        raw_bounds = data.get('bounds')
+        if raw_bounds:
+            try:
+                bounds = (
+                    float(raw_bounds['west']), float(raw_bounds['south']),
+                    float(raw_bounds['east']), float(raw_bounds['north']),
+                )
+                out_w, out_h = compute_output_size(bounds)
+                resolution_m = pixel_ground_resolution_m(bounds, out_w, out_h)
+            except (KeyError, TypeError, ValueError):
+                resolution_m = None  # fall back to date-only preview rather than erroring
+
+        start_natural = get_data_source_for_date(start_date)
+        end_natural = get_data_source_for_date(end_date)
+        start_source = get_data_source_for_date(start_date, resolution_m=resolution_m)
+        end_source = get_data_source_for_date(end_date, resolution_m=resolution_m)
 
         return jsonify({
             'success': True,
@@ -527,13 +636,15 @@ def check_data_availability():
                     'date': start_date,
                     'source': start_source,
                     'resolution': '10m' if start_source == 'sentinel-2' else '30m',
-                    'available': start_source != 'unavailable'
+                    'available': start_source != 'unavailable',
+                    'resolution_capped': start_source != start_natural
                 },
                 'end_date': {
                     'date': end_date,
                     'source': end_source,
                     'resolution': '10m' if end_source == 'sentinel-2' else '30m',
-                    'available': end_source != 'unavailable'
+                    'available': end_source != 'unavailable',
+                    'resolution_capped': end_source != end_natural
                 }
             }
         })
