@@ -8,3 +8,4 @@ scipy>=1.9
 python-dotenv>=1.0
 pystac-client>=0.7
 planetary-computer>=1.0
+gunicorn>=21.0

@@ -1,0 +1,17 @@
+# Render Blueprint for ClearLand.
+# On render.com: New -> Blueprint -> connect this repo -> Render reads this
+# file automatically. Fill in SENTINELHUB_CLIENT_ID / SENTINELHUB_CLIENT_SECRET
+# in the dashboard when prompted (marked sync: false so they aren't stored
+# in the repo).
+services:
+  - type: web
+    name: clearland
+    runtime: python
+    plan: free
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "gunicorn app:app --bind 0.0.0.0:$PORT --timeout 120"
+    envVars:
+      - key: SENTINELHUB_CLIENT_ID
+        sync: false
+      - key: SENTINELHUB_CLIENT_SECRET
+        sync: false
