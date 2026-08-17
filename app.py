@@ -252,7 +252,8 @@ def run_detection(bounds, start_date, end_date):
     import geopandas as gpd
     from rasterio.transform import from_bounds
 
-    from src.spatial import mask_to_polygons, polygon_area_hectares
+    from src.spatial import mask_to_polygons, polygon_area_hectares, filter_cropland_blobs
+    from src.landcover import fetch_cropland_mask
 
     west, south, east, north = bounds
     lat = (south + north) / 2
@@ -285,6 +286,8 @@ def run_detection(bounds, start_date, end_date):
             'bounds': bounds,
             'center': [lat, lon],
             'has_protected_areas': False,
+            'excluded_agricultural': 0,
+            'cropland_filter_applied': False,
             'data_sources': {
                 'start': source_start or 'unavailable',
                 'end': source_end or 'unavailable'
@@ -304,7 +307,21 @@ def run_detection(bounds, start_date, end_date):
 
     delta = ndvi_end - ndvi_start
     valid = ~(np.isnan(delta))
-    loss_mask = np.where(valid, delta < -0.25, False)
+    raw_loss_mask = np.where(valid, delta < -0.25, False)
+
+    # A raw two-date NDVI drop can't distinguish real land clearing from
+    # a farm field that was harvested, rotated, or left fallow between
+    # the two dates -- both look identical as a vegetation-index drop.
+    # Drop any candidate blob that's majority farmland per ESA
+    # WorldCover rather than reporting it as a detection. See
+    # src/landcover.py and src/spatial.py:filter_cropland_blobs for the
+    # actual logic; excluded_agricultural is surfaced in the response so
+    # this filtering is visible, not silent.
+    cropland_mask = fetch_cropland_mask(bounds, out_width, out_height)
+    loss_mask, excluded_agricultural = filter_cropland_blobs(
+        raw_loss_mask, cropland_mask, min_pixels=50
+    )
+    cropland_filter_applied = cropland_mask is not None
 
     polys = mask_to_polygons(loss_mask, transform=transform, min_pixels=50)
 
@@ -344,6 +361,8 @@ def run_detection(bounds, start_date, end_date):
             'bounds': bounds,
             'center': [lat, lon],
             'has_protected_areas': protected_areas is not None and len(protected_areas) > 0,
+            'excluded_agricultural': excluded_agricultural,
+            'cropland_filter_applied': cropland_filter_applied,
             'data_sources': {'start': source_start, 'end': source_end}
         }
     else:
@@ -356,6 +375,8 @@ def run_detection(bounds, start_date, end_date):
             'bounds': bounds,
             'center': [lat, lon],
             'has_protected_areas': False,
+            'excluded_agricultural': excluded_agricultural,
+            'cropland_filter_applied': cropland_filter_applied,
             'data_sources': {'start': source_start, 'end': source_end}
         }
 

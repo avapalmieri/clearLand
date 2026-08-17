@@ -591,6 +591,14 @@
                     <span class="stat-label">Zoning Violations</span>
                     <span class="stat-value" id="zoning-violations" style="color: #f59e0b;">0</span>
                 </div>
+                <div class="stat-row" id="excluded-agricultural-row" style="display: none;">
+                    <span class="stat-label">Excluded (Farmland)</span>
+                    <span class="stat-value" id="excluded-agricultural" style="color: #64748b;">0</span>
+                </div>
+                <div class="data-source-info" id="cropland-filter-note" style="margin-top: 8px; display: none;">
+                    Farmland cropland filter unavailable for this run (land-cover lookup failed) —
+                    detections may include ordinary crop cycling misread as vegetation loss.
+                </div>
 
                 <div class="data-source-info" id="result-sources" style="margin-top: 12px;">
                     <div class="title">Data Sources Used</div>
@@ -871,12 +879,17 @@
                 endEl.className = 'source-badge ' + getSourceClass(results.data_sources.end);
             }
 
+            const excludedRow = document.getElementById('excluded-agricultural-row');
+            const croplandNote = document.getElementById('cropland-filter-note');
+
             if (results.data_available === false) {
                 // No fake data to show -- surface exactly why real imagery
                 // couldn't be obtained instead of a misleading zero-violation result.
                 document.getElementById('total-detections').textContent = '—';
                 document.getElementById('veg-loss').textContent = '—';
                 document.getElementById('zoning-violations').textContent = '—';
+                excludedRow.style.display = 'none';
+                croplandNote.style.display = 'none';
 
                 const messages = Object.entries(results.errors || {})
                     .map(([which, msg]) => `<strong>${which === 'start' ? 'Start date' : 'End date'}:</strong> ${msg}`)
@@ -888,6 +901,18 @@
                 document.getElementById('total-detections').textContent = results.total_detections;
                 document.getElementById('veg-loss').textContent = results.vegetation_loss || 0;
                 document.getElementById('zoning-violations').textContent = results.zoning_violations || 0;
+
+                // Show how many detections were dropped as likely farmland,
+                // and be upfront when that filter didn't run at all rather
+                // than silently returning unfiltered results.
+                if (results.cropland_filter_applied) {
+                    excludedRow.style.display = 'flex';
+                    document.getElementById('excluded-agricultural').textContent = results.excluded_agricultural || 0;
+                    croplandNote.style.display = 'none';
+                } else {
+                    excludedRow.style.display = 'none';
+                    croplandNote.style.display = 'block';
+                }
             }
 
             // Show results panel

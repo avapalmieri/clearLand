@@ -70,6 +70,57 @@ def mask_to_polygons(mask, transform, min_pixels=50):
     return polygons
 
 
+def filter_cropland_blobs(mask, cropland_mask, min_pixels=50, cropland_fraction_threshold=0.5):
+    """
+    Given a raw NDVI-loss mask and a same-shape boolean cropland mask
+    (see src/landcover.py), drop entire connected blobs that are
+    majority-cropland by pixel count.
+
+    This operates blob-by-blob rather than pixel-by-pixel: a blob that's
+    mostly real land clearing but clips the edge of a field keeps its
+    full natural shape, instead of getting notched/fragmented by
+    removing individual cropland pixels from inside it. A blob is only
+    dropped if the *majority* of its pixels fall on cropland -- the
+    threshold that "this is farmland, not a violation" is a real
+    judgment call, and this defaults to a plain majority rather than
+    something more aggressive.
+
+    A blob under min_pixels is dropped silently, same as always -- too
+    small to be meaningful regardless of land cover, and NOT counted as
+    "excluded for being agricultural" since that wasn't why it was
+    dropped.
+
+    If cropland_mask is None (the WorldCover lookup failed or the
+    optional dependency isn't installed), no filtering happens --
+    everything above min_pixels passes through unchanged.
+
+    Returns (kept_mask, excluded_agricultural_count).
+    """
+    mask_u8 = mask.astype(np.uint8)
+    labeled, num_features = ndimage.label(mask_u8)
+    if num_features == 0:
+        return np.zeros_like(mask, dtype=bool), 0
+
+    kept = np.zeros_like(mask, dtype=bool)
+    excluded_agricultural = 0
+
+    for lbl in range(1, num_features + 1):
+        blob = labeled == lbl
+        count = int(blob.sum())
+        if count < min_pixels:
+            continue
+
+        if cropland_mask is not None:
+            cropland_fraction = float(cropland_mask[blob].mean())
+            if cropland_fraction > cropland_fraction_threshold:
+                excluded_agricultural += 1
+                continue
+
+        kept |= blob
+
+    return kept, excluded_agricultural
+
+
 def polygon_area_hectares(gdf):
     """
     Compute polygon areas in hectares by reprojecting to an appropriate
