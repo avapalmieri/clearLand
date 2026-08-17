@@ -17,6 +17,7 @@ instead of making something up.
 
 import io
 import json
+import math
 import os
 from datetime import datetime, timedelta
 
@@ -29,6 +30,15 @@ load_dotenv()
 app = Flask(__name__)
 app.config['UPLOAD_FOLDER'] = 'uploads'
 app.config['OUTPUT_FOLDER'] = 'outputs'
+
+# Server-side mirror of the frontend's zoom-out guard: reject an analysis
+# request over an oversized area rather than silently computing NDVI at a
+# resolution too coarse to mean anything (e.g. the whole visible world
+# squeezed into a 512-pixel image). The frontend enforces this too so
+# users get instant feedback without a round trip, but the API validates
+# independently since client-side checks can be bypassed.
+MAX_SPAN_DEGREES = 2.0
+MAX_OUTPUT_DIM = 512
 
 # Sentinel Hub / Copernicus Data Space credentials.
 # Set these in the environment (e.g. a .env file, see .env.example) --
@@ -46,6 +56,39 @@ os.makedirs('temp_data', exist_ok=True)
 class ImageFetchError(Exception):
     """Raised when real satellite imagery cannot be obtained for a date.
     Callers must surface this to the user, not substitute fake data."""
+
+
+def compute_output_size(bounds, max_dim=MAX_OUTPUT_DIM):
+    """
+    Pick a (width, height) pixel grid for a bounding box that preserves
+    its real-world aspect ratio -- accounting for longitude foreshortening
+    at higher latitudes -- instead of forcing every request into a fixed
+    square grid.
+
+    This matters now that the analysis area is whatever the user's map
+    viewport shows (a browser window, rarely square) rather than a fixed
+    square buffer around a point. Requesting a square image for a wide,
+    short bounding box would stretch the imagery non-uniformly, which
+    would throw off the pixel-to-pixel NDVI delta comparison between the
+    two dates.
+    """
+    west, south, east, north = bounds
+    lat_center = (south + north) / 2
+    width_deg = max(east - west, 1e-9)
+    height_deg = max(north - south, 1e-9)
+
+    # Rough km-per-degree conversion; longitude degrees shrink toward the
+    # poles by cos(latitude), latitude degrees don't.
+    width_km = max(width_deg * 111.32 * math.cos(math.radians(lat_center)), 1e-6)
+    height_km = max(height_deg * 111.32, 1e-6)
+
+    if width_km >= height_km:
+        out_w = max_dim
+        out_h = max(16, round(max_dim * height_km / width_km))
+    else:
+        out_h = max_dim
+        out_w = max(16, round(max_dim * width_km / height_km))
+    return out_w, out_h
 
 
 def get_data_source_for_date(date_str):
@@ -91,7 +134,7 @@ def get_sentinelhub_token():
     return None
 
 
-def fetch_sentinel_ndvi(bounds, date_str, token, out_size=512):
+def fetch_sentinel_ndvi(bounds, date_str, token, out_width=512, out_height=512):
     """Fetch real NDVI from Sentinel-2 via Copernicus Data Space Process API."""
     try:
         target_date = datetime.strptime(date_str, '%Y-%m-%d')
@@ -128,8 +171,8 @@ def fetch_sentinel_ndvi(bounds, date_str, token, out_size=512):
                 }]
             },
             "output": {
-                "width": out_size,
-                "height": out_size,
+                "width": out_width,
+                "height": out_height,
                 "responses": [{"identifier": "default", "format": {"type": "image/tiff"}}]
             },
             "evalscript": evalscript
@@ -152,7 +195,7 @@ def fetch_sentinel_ndvi(bounds, date_str, token, out_size=512):
     return None
 
 
-def fetch_ndvi_for_date(bounds, date_str, out_size=512):
+def fetch_ndvi_for_date(bounds, date_str, out_width=512, out_height=512):
     """
     Fetch REAL NDVI imagery for a date, using whichever data source
     actually covers it. Raises ImageFetchError (never returns fabricated
@@ -171,7 +214,7 @@ def fetch_ndvi_for_date(bounds, date_str, out_size=512):
                 f"Could not authenticate with Copernicus Data Space for {date_str} "
                 f"(check SENTINELHUB_CLIENT_ID/SECRET)."
             )
-        data = fetch_sentinel_ndvi(bounds, date_str, token, out_size=out_size)
+        data = fetch_sentinel_ndvi(bounds, date_str, token, out_width=out_width, out_height=out_height)
         if data is None:
             raise ImageFetchError(
                 f"No cloud-free Sentinel-2 scene found within 15 days of {date_str} "
@@ -182,7 +225,7 @@ def fetch_ndvi_for_date(bounds, date_str, out_size=512):
 
     elif source.startswith('landsat'):
         from src.landsat import fetch_landsat_ndvi
-        ndvi = fetch_landsat_ndvi(bounds, date_str, out_size=out_size)
+        ndvi = fetch_landsat_ndvi(bounds, date_str, out_width=out_width, out_height=out_height)
         if ndvi is None:
             raise ImageFetchError(
                 f"No usable Landsat scene found within 30 days of {date_str} "
@@ -196,10 +239,12 @@ def fetch_ndvi_for_date(bounds, date_str, out_size=512):
         )
 
 
-def run_detection(lat, lon, start_date, end_date):
+def run_detection(bounds, start_date, end_date):
     """
-    Detect vegetation loss using real satellite imagery only. If real
-    imagery isn't available for either date, returns
+    Detect vegetation loss using real satellite imagery only, over the
+    given (west, south, east, north) bounds -- typically the caller's
+    current map viewport, not a fixed-size box around a single point.
+    If real imagery isn't available for either date, returns
     `data_available: False` with a per-date explanation instead of
     fabricating a result.
     """
@@ -209,22 +254,23 @@ def run_detection(lat, lon, start_date, end_date):
 
     from src.spatial import mask_to_polygons, polygon_area_hectares
 
-    buffer = 0.05
-    bounds = (lon - buffer, lat - buffer, lon + buffer, lat + buffer)
-    out_size = 512
-    transform = from_bounds(*bounds, out_size, out_size)
+    west, south, east, north = bounds
+    lat = (south + north) / 2
+    lon = (west + east) / 2
+    out_width, out_height = compute_output_size(bounds)
+    transform = from_bounds(*bounds, out_width, out_height)
 
     fetch_errors = {}
     ndvi_start = source_start = None
     ndvi_end = source_end = None
 
     try:
-        ndvi_start, source_start = fetch_ndvi_for_date(bounds, start_date, out_size=out_size)
+        ndvi_start, source_start = fetch_ndvi_for_date(bounds, start_date, out_width=out_width, out_height=out_height)
     except ImageFetchError as e:
         fetch_errors['start'] = str(e)
 
     try:
-        ndvi_end, source_end = fetch_ndvi_for_date(bounds, end_date, out_size=out_size)
+        ndvi_end, source_end = fetch_ndvi_for_date(bounds, end_date, out_width=out_width, out_height=out_height)
     except ImageFetchError as e:
         fetch_errors['end'] = str(e)
 
@@ -248,7 +294,7 @@ def run_detection(lat, lon, start_date, end_date):
     # Persist rasters for debugging/inspection.
     import rasterio
     profile = {
-        'driver': 'GTiff', 'dtype': 'float32', 'width': out_size, 'height': out_size,
+        'driver': 'GTiff', 'dtype': 'float32', 'width': out_width, 'height': out_height,
         'count': 1, 'crs': 'EPSG:4326', 'transform': transform,
     }
     with rasterio.open('temp_data/ndvi_start.tif', 'w', **profile) as dst:
@@ -363,29 +409,60 @@ def home():
 
 @app.route('/analyze', methods=['POST'])
 def analyze():
-    """Run detection on specified location using real satellite data only."""
+    """
+    Run detection using real satellite data only, over either an explicit
+    `bounds` viewport (preferred -- sent as the current map view) or, for
+    backward compatibility, a lone `lat`/`lon` point with the old fixed
+    0.05-degree buffer.
+    """
     try:
         data = request.get_json(force=True) or {}
 
         location = data.get('location', '')
-        lat = data.get('lat')
-        lon = data.get('lon')
         start_date = data.get('start_date')
         end_date = data.get('end_date')
+        raw_bounds = data.get('bounds')
 
-        if lat is None or lon is None:
-            return jsonify({'success': False, 'error': 'lat and lon are required'}), 400
-        try:
-            lat = float(lat)
-            lon = float(lon)
-        except (TypeError, ValueError):
-            return jsonify({'success': False, 'error': 'lat and lon must be numbers'}), 400
-        if not (-90 <= lat <= 90 and -180 <= lon <= 180):
-            return jsonify({'success': False, 'error': 'lat/lon out of valid range'}), 400
+        if raw_bounds:
+            try:
+                west = float(raw_bounds['west'])
+                south = float(raw_bounds['south'])
+                east = float(raw_bounds['east'])
+                north = float(raw_bounds['north'])
+            except (KeyError, TypeError, ValueError):
+                return jsonify({'success': False, 'error': 'bounds must include numeric west/south/east/north'}), 400
+        else:
+            lat = data.get('lat')
+            lon = data.get('lon')
+            if lat is None or lon is None:
+                return jsonify({'success': False, 'error': 'either bounds or lat/lon are required'}), 400
+            try:
+                lat = float(lat)
+                lon = float(lon)
+            except (TypeError, ValueError):
+                return jsonify({'success': False, 'error': 'lat and lon must be numbers'}), 400
+            if not (-90 <= lat <= 90 and -180 <= lon <= 180):
+                return jsonify({'success': False, 'error': 'lat/lon out of valid range'}), 400
+            legacy_buffer = 0.05
+            west, south, east, north = lon - legacy_buffer, lat - legacy_buffer, lon + legacy_buffer, lat + legacy_buffer
+
+        if not (-90 <= south < north <= 90) or not (-180 <= west < east <= 180):
+            return jsonify({
+                'success': False,
+                'error': 'invalid bounds: expected west < east and south < north within valid lat/lon ranges'
+            }), 400
+
+        if (east - west) > MAX_SPAN_DEGREES or (north - south) > MAX_SPAN_DEGREES:
+            return jsonify({
+                'success': False,
+                'error': f'Selected area is too large ({east - west:.2f}° × {north - south:.2f}°). '
+                         f'Zoom in closer -- max supported span is {MAX_SPAN_DEGREES}° in either direction.'
+            }), 400
+
         if not start_date or not end_date:
             return jsonify({'success': False, 'error': 'start_date and end_date are required'}), 400
 
-        results = run_detection(lat, lon, start_date, end_date)
+        results = run_detection((west, south, east, north), start_date, end_date)
 
         if results.get('data_available', True):
             message = f'Analysis complete for {location}'

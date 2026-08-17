@@ -482,10 +482,10 @@
         <aside class="sidebar">
             <div class="instructions">
                 <strong>How to use:</strong><br>
-                1. Click on the map to select a location, or enter coordinates<br>
+                1. Pan and zoom the map to frame the area you want to check<br>
                 2. Choose your date range (real imagery available from 1984, subject to actual scene/cloud-cover availability)<br>
-                3. Click "Run Analysis" to detect violations<br><br>
-                Only real satellite imagery is used. If no cloud-free scene exists near a chosen date, the analysis will report that instead of guessing.
+                3. Click "Run Analysis" to scan the entire visible map area<br><br>
+                The whole visible map is analyzed, not just a point -- zoom in for a smaller, more detailed area, or out for wider coverage (up to about 2&deg; across). A dashed outline shows exactly what gets analyzed. Only real satellite imagery is used; if no cloud-free scene exists near a chosen date, the analysis will report that instead of guessing.
             </div>
 
             <!-- Satellite Timeline -->
@@ -519,19 +519,19 @@
             </div>
 
             <div class="section-title">Location</div>
-            
+
             <div class="form-group">
-                <label>Search Location</label>
+                <label>Search Location (recenters map)</label>
                 <input type="text" id="location-search" placeholder="Enter city, address, or place...">
             </div>
 
             <div class="form-row">
                 <div class="form-group">
-                    <label>Latitude</label>
+                    <label>Latitude (recenters map)</label>
                     <input type="number" id="lat" step="0.0001" placeholder="-3.0000">
                 </div>
                 <div class="form-group">
-                    <label>Longitude</label>
+                    <label>Longitude (recenters map)</label>
                     <input type="number" id="lon" step="0.0001" placeholder="-60.0000">
                 </div>
             </div>
@@ -644,15 +644,23 @@
 
         let marker = null;
         let dataLayer = null;
+        let boundsRectangle = null;
+
+        // The area actually analyzed is always whatever the map is
+        // currently showing (see runAnalysis) -- max span an analysis
+        // request will accept before the UI blocks submission and asks
+        // you to zoom in. Must match MAX_SPAN_DEGREES in app.py; the
+        // backend enforces its own copy of this limit independently.
+        const MAX_ANALYSIS_SPAN_DEGREES = 2.0;
 
         // Click on map to select location
         map.on('click', function(e) {
             const lat = e.latlng.lat.toFixed(4);
             const lon = e.latlng.lng.toFixed(4);
-            
+
             document.getElementById('lat').value = lat;
             document.getElementById('lon').value = lon;
-            
+
             updateMarker(lat, lon);
         });
 
@@ -663,6 +671,20 @@
             marker = L.marker([lat, lon]).addTo(map);
             map.setView([lat, lon], 12);
         }
+
+        // Manually typing coordinates also recenters the map, since the
+        // map's current viewport -- not these fields -- is what actually
+        // gets analyzed. Without this, typed coordinates would silently
+        // have no effect on what "Run Analysis" scans.
+        function syncMapToTypedCoords() {
+            const lat = parseFloat(document.getElementById('lat').value);
+            const lon = parseFloat(document.getElementById('lon').value);
+            if (!isNaN(lat) && !isNaN(lon)) {
+                updateMarker(lat, lon);
+            }
+        }
+        document.getElementById('lat').addEventListener('change', syncMapToTypedCoords);
+        document.getElementById('lon').addEventListener('change', syncMapToTypedCoords);
 
         // Date presets
         function setDatePreset(preset) {
@@ -764,18 +786,41 @@
             }
         });
 
-        // Run analysis
+        // Run analysis over whatever the map is currently showing
         async function runAnalysis() {
-            const lat = parseFloat(document.getElementById('lat').value);
-            const lon = parseFloat(document.getElementById('lon').value);
             const startDate = document.getElementById('start-date').value;
             const endDate = document.getElementById('end-date').value;
-            const location = document.getElementById('location-search').value || `${lat}, ${lon}`;
+            const location = document.getElementById('location-search').value || 'selected area';
 
-            if (!lat || !lon) {
-                alert('Please select a location on the map or enter coordinates');
+            const mapBounds = map.getBounds();
+            const bounds = {
+                west: mapBounds.getWest(),
+                south: mapBounds.getSouth(),
+                east: mapBounds.getEast(),
+                north: mapBounds.getNorth()
+            };
+            const spanLon = bounds.east - bounds.west;
+            const spanLat = bounds.north - bounds.south;
+
+            if (spanLon > MAX_ANALYSIS_SPAN_DEGREES || spanLat > MAX_ANALYSIS_SPAN_DEGREES) {
+                alert(
+                    `The visible map area is too large to analyze in detail ` +
+                    `(${spanLon.toFixed(2)}° × ${spanLat.toFixed(2)}°). ` +
+                    `Zoom in closer -- max supported span is ${MAX_ANALYSIS_SPAN_DEGREES}° in either direction.`
+                );
                 return;
             }
+
+            // Show exactly what's about to be analyzed, before the request
+            // even finishes -- removes any doubt about "did it use the
+            // area I'm looking at or something else."
+            if (boundsRectangle) {
+                map.removeLayer(boundsRectangle);
+            }
+            boundsRectangle = L.rectangle(
+                [[bounds.south, bounds.west], [bounds.north, bounds.east]],
+                { color: '#4ade80', weight: 1.5, fill: false, dashArray: '6,4' }
+            ).addTo(map);
 
             // Show loading
             document.getElementById('loading').classList.add('visible');
@@ -787,7 +832,7 @@
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({
-                        lat, lon,
+                        bounds,
                         start_date: startDate,
                         end_date: endDate,
                         location
